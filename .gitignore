@@ -1,0 +1,12 @@
+﻿# Ignore cache and personal data
+classes.json
+daemon.pid
+daemon.log
+daemon_error.log
+verify_*.png
+
+# Ignore Python and Pyinstaller build folders
+__pycache__/
+build/
+dist/
+*.spec
