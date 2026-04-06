@@ -10,6 +10,9 @@ import subprocess
 import threading
 import uuid
 import urllib.parse
+import urllib.request
+import zipfile
+import io
 import PIL
 import pygetwindow as gw
 from datetime import datetime, timedelta
@@ -43,6 +46,10 @@ JSON_FILE = os.path.join(get_app_dir(), "classes.json")
 JOIN_BTN_IMAGE = get_resource_path("join_now.png")
 PID_FILE = os.path.join(get_app_dir(), "daemon.pid")
 LOG_FILE = os.path.join(get_app_dir(), "daemon.log")
+RECORDINGS_DIR = os.path.join(get_app_dir(), "Recordings")
+
+if not os.path.exists(RECORDINGS_DIR):
+    os.makedirs(RECORDINGS_DIR)
 
 # ==========================================
 # 2. DATA MANAGEMENT & UTILS
@@ -55,6 +62,8 @@ def load_data():
             "join_delay": 15,
             "screenshot_delay": 300,
             "remote_cooldown": 60,
+            "enable_recording": False,
+            "recording_duration": 90,
             "remote_topic": f"cheese_cmd_{uuid.uuid4().hex[:12]}",
             "lectures": []
         }
@@ -68,6 +77,8 @@ def load_data():
     if "join_delay" not in data: data["join_delay"] = 15; updated = True
     if "screenshot_delay" not in data: data["screenshot_delay"] = 300; updated = True
     if "remote_cooldown" not in data: data["remote_cooldown"] = 60; updated = True
+    if "enable_recording" not in data: data["enable_recording"] = False; updated = True
+    if "recording_duration" not in data: data["recording_duration"] = 90; updated = True
     if "remote_topic" not in data: data["remote_topic"] = f"cheese_cmd_{uuid.uuid4().hex[:12]}"; updated = True
         
     for lec in data.get("lectures", []):
@@ -111,7 +122,81 @@ def clean_teams_link(url):
     return url
 
 # ==========================================
-# 3. NOTIFICATIONS & AUTOMATION
+# 3. AUDIO RECORDING ENGINE
+# ==========================================
+
+def bootstrap_ffmpeg():
+    ffmpeg_path = os.path.join(get_app_dir(), "ffmpeg.exe")
+    if os.path.exists(ffmpeg_path):
+        return ffmpeg_path
+
+    print("Downloading audio engine...")
+    try:
+        url = "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl.zip"
+        req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+        with urllib.request.urlopen(req) as response:
+            with zipfile.ZipFile(io.BytesIO(response.read())) as zip_ref:
+                for file_info in zip_ref.infolist():
+                    if file_info.filename.endswith("ffmpeg.exe"):
+                        file_info.filename = "ffmpeg.exe" 
+                        zip_ref.extract(file_info, get_app_dir())
+                        print("Audio engine downloaded successfully.")
+                        return ffmpeg_path
+    except Exception as e:
+        print(f"Failed to download audio engine: {e}")
+        return None
+
+def start_audio_recording(class_name, duration_mins, webhook_url):
+    ffmpeg_path = bootstrap_ffmpeg()
+    if not ffmpeg_path:
+        send_discord_ping(webhook_url, "Recording Error", "Failed", "Could not locate or download the audio engine.")
+        return
+
+    safe_name = "".join([c for c in class_name if c.isalpha() or c.isdigit() or c==' ']).rstrip()
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M")
+    filename = f"{safe_name}_{timestamp}.m4a"
+    output_path = os.path.join(RECORDINGS_DIR, filename.replace(" ", "_"))
+    
+    duration_secs = int(duration_mins) * 60
+
+    print(f"Starting background audio recording for {duration_mins} minutes...")
+    
+    cmd = [
+        ffmpeg_path,
+        "-y", 
+        "-f", "wasapi", 
+        "-i", "default", 
+        "-t", str(duration_secs),
+        "-c:a", "aac", 
+        "-b:a", "128k", 
+        output_path
+    ]
+    
+    try:
+        startupinfo = subprocess.STARTUPINFO()
+        startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+        
+        subprocess.Popen(cmd, startupinfo=startupinfo, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        send_discord_ping(webhook_url, "Recording Started", "Info", f"Audio for **{class_name}** is recording. It will save to the Recordings folder in {duration_mins} minutes.")
+    except Exception as e:
+        print(f"Failed to launch recorder: {e}")
+        send_discord_ping(webhook_url, "Recording Error", "Failed", str(e))
+
+def stop_audio_recording(silent=False, webhook_url=""):
+    try:
+        output = subprocess.getoutput('tasklist /FI "IMAGENAME eq ffmpeg.exe"')
+        if "ffmpeg.exe" in output:
+            subprocess.run("taskkill /IM ffmpeg.exe /F", shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            if not silent: console.print("[bold green]Recording stopped and saved.[/bold green]\n")
+            if webhook_url: send_discord_ping(webhook_url, "Recording Stopped", "Success", "The active audio recording was manually stopped and saved.")
+        else:
+            if not silent: console.print("[yellow]No active recording found.[/yellow]\n")
+            if webhook_url: send_discord_ping(webhook_url, "Stop Recording", "Info", "There was no active recording to stop.")
+    except Exception as e:
+        if not silent: console.print(f"[bold red]Failed to stop recording: {e}[/bold red]\n")
+
+# ==========================================
+# 4. NOTIFICATIONS & AUTOMATION
 # ==========================================
 
 def send_discord_ping(webhook_url, class_name, status="Success", details=""):
@@ -145,7 +230,7 @@ def capture_and_send_screenshot(webhook_url, class_name):
     finally:
         if os.path.exists(screenshot_path): os.remove(screenshot_path)
 
-def execute_join(name, url, webhook_url, join_delay, screenshot_delay):
+def execute_join(name, url, webhook_url, join_delay, screenshot_delay, enable_recording, recording_duration):
     global last_failed_job
     print(f"\n[{time.strftime('%H:%M:%S')}] Launching {name}...")
     send_discord_ping(webhook_url, name, "Info", f"Opening Teams... waiting {join_delay}s for app to load.")
@@ -175,19 +260,22 @@ def execute_join(name, url, webhook_url, join_delay, screenshot_delay):
             send_discord_ping(webhook_url, name, "Success", f"Starting {mins_display}-minute verification timer.")
             threading.Timer(float(screenshot_delay), capture_and_send_screenshot, args=[webhook_url, name]).start()
             
+            if enable_recording:
+                start_audio_recording(name, recording_duration, webhook_url)
+            
             if last_failed_job and last_failed_job.get("name") == name:
                 last_failed_job = {}
         else:
             print("Failed to find button.")
             send_discord_ping(webhook_url, name, "Failed", "Button not visible on screen. Send 'retry' to attempt again.")
-            last_failed_job = {"name": name, "url": url, "webhook_url": webhook_url, "join_delay": join_delay, "screenshot_delay": screenshot_delay}
+            last_failed_job = {"name": name, "url": url, "webhook_url": webhook_url, "join_delay": join_delay, "screenshot_delay": screenshot_delay, "enable_recording": enable_recording, "recording_duration": recording_duration}
     except Exception as e:
         print(f"Join Exception: {e}")
         send_discord_ping(webhook_url, name, "Failed", f"Error: {str(e)}. Send 'retry' to attempt again.")
-        last_failed_job = {"name": name, "url": url, "webhook_url": webhook_url, "join_delay": join_delay, "screenshot_delay": screenshot_delay}
+        last_failed_job = {"name": name, "url": url, "webhook_url": webhook_url, "join_delay": join_delay, "screenshot_delay": screenshot_delay, "enable_recording": enable_recording, "recording_duration": recording_duration}
 
 # ==========================================
-# 4. REMOTE LISTENER THREAD
+# 5. REMOTE LISTENER THREAD
 # ==========================================
 
 def ntfy_listener(topic, webhook_url):
@@ -234,6 +322,8 @@ def ntfy_listener(topic, webhook_url):
                                 threading.Thread(target=execute_join, kwargs=last_failed_job, daemon=True).start()
                             else:
                                 send_discord_ping(webhook_url, "Manual Retry", "Failed", "There are no recently failed classes to retry.")
+                        elif msg in ["stop", "stop record"]:
+                            stop_audio_recording(silent=True, webhook_url=webhook_url)
                         else:
                             capture_and_send_screenshot(webhook_url, "Manual Remote Request")
         except Exception as e:
@@ -241,7 +331,7 @@ def ntfy_listener(topic, webhook_url):
             time.sleep(10)
 
 # ==========================================
-# 5. DAEMON PROCESSES & SYSTEM CONTROLS
+# 6. DAEMON PROCESSES & SYSTEM CONTROLS
 # ==========================================
 
 def check_daemon_status():
@@ -253,52 +343,6 @@ def check_daemon_status():
     output = subprocess.getoutput(f'tasklist /FI "PID eq {pid}"')
     return (pid in output), pid
 
-def run_daemon():
-    is_running, old_pid = check_daemon_status()
-    if is_running and str(old_pid) != str(os.getpid()):
-        subprocess.run(f"taskkill /PID {old_pid} /F", shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        time.sleep(1)
-
-    with open(PID_FILE, "w") as f:
-        f.write(str(os.getpid()))
-        
-    data = load_data()
-    join_delay = data.get("join_delay", 15)
-    screenshot_delay = data.get("screenshot_delay", 300)
-    webhook = data.get("webhook_url", "")
-    topic = data.get("remote_topic", "")
-    
-    threading.Thread(target=ntfy_listener, args=(topic, webhook), daemon=True).start()
-    
-    for lec in data.get("lectures", []):
-        for day in lec["days"]:
-            day_func = getattr(schedule.every(), day)
-            day_func.at(lec["time"]).do(execute_join, name=lec["name"], url=lec["url"], webhook_url=webhook, join_delay=join_delay, screenshot_delay=screenshot_delay)
-    
-    print("Schedules loaded. Entering main waiting loop.")
-    while True:
-        schedule.run_pending()
-        time.sleep(30)
-
-def spawn_background_daemon(silent=False):
-    try:
-        kwargs = {}
-        if sys.platform == "win32":
-            CREATE_NO_WINDOW = 0x08000000 
-            kwargs = {"creationflags": CREATE_NO_WINDOW}
-
-        cmd = [sys.executable, '--background'] if getattr(sys, 'frozen', False) else [sys.executable, os.path.abspath(__file__), '--background']
-        
-        subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, **kwargs)
-            
-        if not silent:
-            console.print("[bold green]Daemon launched. Monitoring schedule and listening for remote commands.[/bold green]\n")
-        else:
-            console.print("[dim green]Background daemon refreshed to apply changes.[/dim green]\n")
-    except Exception as e:
-        if not silent:
-            console.print(f"[bold red]Failed to start: {e}[/bold red]\n")
-
 def kill_daemon(silent=False):
     is_running, pid = check_daemon_status()
     if is_running:
@@ -307,6 +351,51 @@ def kill_daemon(silent=False):
     else:
         if not silent: console.print("[yellow]Daemon process not found. Cleaning up cache.[/yellow]\n")
     if os.path.exists(PID_FILE): os.remove(PID_FILE)
+
+def run_daemon():
+    with open(PID_FILE, "w") as f:
+        f.write(str(os.getpid()))
+        
+    data = load_data()
+    join_delay = data.get("join_delay", 15)
+    screenshot_delay = data.get("screenshot_delay", 300)
+    enable_recording = data.get("enable_recording", False)
+    recording_duration = data.get("recording_duration", 90)
+    webhook = data.get("webhook_url", "")
+    topic = data.get("remote_topic", "")
+    
+    threading.Thread(target=ntfy_listener, args=(topic, webhook), daemon=True).start()
+    
+    for lec in data.get("lectures", []):
+        for day in lec["days"]:
+            day_func = getattr(schedule.every(), day)
+            day_func.at(lec["time"]).do(execute_join, name=lec["name"], url=lec["url"], webhook_url=webhook, join_delay=join_delay, screenshot_delay=screenshot_delay, enable_recording=enable_recording, recording_duration=recording_duration)
+    
+    print("Schedules loaded. Entering main waiting loop.")
+    while True:
+        schedule.run_pending()
+        time.sleep(10)
+
+def spawn_background_daemon(silent=False):
+    kill_daemon(silent=True)
+    time.sleep(0.5)
+    try:
+        kwargs = {}
+        if sys.platform == "win32":
+            DETACHED_PROCESS = 0x00000008
+            CREATE_NEW_PROCESS_GROUP = 0x00000200
+            CREATE_NO_WINDOW = 0x08000000 
+            kwargs = {"creationflags": DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW}
+
+        cmd = [sys.executable, '--background'] if getattr(sys, 'frozen', False) else [sys.executable, os.path.abspath(__file__), '--background']
+        
+        subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, **kwargs)
+            
+        if not silent:
+            console.print("[bold green]Daemon launched. You can safely close this window.[/bold green]\n")
+    except Exception as e:
+        if not silent:
+            console.print(f"[bold red]Failed to start: {e}[/bold red]\n")
 
 def toggle_startup():
     startup_dir = os.path.join(os.getenv('APPDATA'), r"Microsoft\Windows\Start Menu\Programs\Startup")
@@ -333,7 +422,7 @@ def auto_refresh_daemon():
         spawn_background_daemon(silent=True)
 
 # ==========================================
-# 6. INTERACTIVE MODULES & HELP
+# 7. INTERACTIVE MODULES & HELP
 # ==========================================
 
 def manage_settings():
@@ -342,11 +431,13 @@ def manage_settings():
     
     current_webhook = data.get('webhook_url', 'Not Set')
     hidden_webhook = f"{current_webhook[:35]}..." if len(current_webhook) > 35 else current_webhook
+    rec_status = "[green]Enabled[/green]" if data.get('enable_recording') else "[red]Disabled[/red]"
     
     console.print(f"Discord Webhook: [cyan]{hidden_webhook}[/cyan]")
     console.print(f"App Load Wait Delay: [cyan]{data.get('join_delay', 15)} seconds[/cyan]")
     console.print(f"Screenshot Timer: [cyan]{data.get('screenshot_delay', 300)} seconds[/cyan]")
     console.print(f"Remote Cooldown: [cyan]{data.get('remote_cooldown', 60)} seconds[/cyan]")
+    console.print(f"Auto-Record Audio: {rec_status} [cyan]({data.get('recording_duration', 90)} mins)[/cyan]")
     console.print(f"Remote Trigger URL: [cyan]https://ntfy.sh/{data.get('remote_topic')}[/cyan]\n")
     
     changed = False
@@ -361,6 +452,11 @@ def manage_settings():
         changed = True
     if Confirm.ask("[yellow]Change remote cooldown rate limit?[/yellow]"):
         data["remote_cooldown"] = IntPrompt.ask("[green]New cooldown (in seconds)[/green]", default=data.get('remote_cooldown', 60))
+        changed = True
+    if Confirm.ask("[yellow]Toggle Auto-Recording of Class Audio?[/yellow]"):
+        data["enable_recording"] = not data.get("enable_recording", False)
+        if data["enable_recording"]:
+            data["recording_duration"] = IntPrompt.ask("[green]Default recording length (in minutes)[/green]", default=data.get('recording_duration', 90))
         changed = True
         
     if changed:
@@ -444,6 +540,7 @@ def show_help():
     Go to Option 5 (Settings) and copy your unique ntfy.sh URL. Open it on your phone.
     - Send [bold green]ping[/bold green]: Returns the time remaining until your next scheduled class.
     - Send [bold green]retry[/bold green]: Forces the app to attempt joining the last class that failed.
+    - Send [bold green]stop[/bold green]: Manually ends and saves an ongoing audio recording early.
     - Send [bold green]anything else[/bold green]: Forces the app to take a screenshot and send it to Discord.
     
     [bold cyan]The Link Converter:[/bold cyan]
@@ -461,12 +558,13 @@ def show_help():
     console.print(Panel(help_text, title="🧀 Online Cheese Help Guide", border_style="blue"))
 
 # ==========================================
-# 7. MAIN MENU
+# 8. MAIN MENU
 # ==========================================
 
 def main_menu():
     dev_mode = False
     while True:
+        console.clear()
         console.print(Panel.fit("[bold yellow]🧀 Online Cheese[/bold yellow]", border_style="yellow"))
         
         is_running, _ = check_daemon_status()
@@ -484,7 +582,7 @@ def main_menu():
         menu.add_row("", "")
         
         menu.add_row("[bold yellow]━━━ Configuration ━━━[/bold yellow]", "")
-        menu.add_row("[yellow]5.[/yellow]", "Settings (Webhook, Delay, Timers)")
+        menu.add_row("[yellow]5.[/yellow]", "Settings (Webhook, Audio Recording, Timers)")
         
         menu.add_row("", "")
         
@@ -492,12 +590,13 @@ def main_menu():
         menu.add_row("[magenta]6.[/magenta]", f"Start Background Daemon [{status_color}]({status_text})[/{status_color}]")
         menu.add_row("[magenta]7.[/magenta]", "Check Daemon Status")
         menu.add_row("[magenta]8.[/magenta]", "Toggle Windows Startup")
-        menu.add_row("[red]9.[/red]", "Kill Background Daemon")
+        menu.add_row("[magenta]9.[/magenta]", "Stop Active Audio Recording")
+        menu.add_row("[red]10.[/red]", "Kill Background Daemon")
         
         menu.add_row("", "")
         
         menu.add_row("[bold blue]━━━ Application ━━━[/bold blue]", "")
-        menu.add_row("[blue]10.[/blue]", "Help / About")
+        menu.add_row("[blue]11.[/blue]", "Help / About")
         
         if dev_mode:
             menu.add_row("[dim yellow]98.[/dim yellow]", "[dim yellow]DEV: Test Join Immediately[/dim yellow]")
@@ -518,23 +617,23 @@ def main_menu():
         elif choice == "5": manage_settings()
         elif choice == "6": 
             spawn_background_daemon()
-            time.sleep(1.5) 
         elif choice == "7": 
             is_run, pid = check_daemon_status()
             if is_run: console.print(f"[bold green]Daemon is running (PID: {pid}).[/bold green]\n")
             else: console.print("[bold red]Daemon is not running.[/bold red]\n")
         elif choice == "8": toggle_startup()
-        elif choice == "9": kill_daemon()
-        elif choice == "10": show_help()
+        elif choice == "9": stop_audio_recording()
+        elif choice == "10": kill_daemon()
+        elif choice == "11": show_help()
         elif choice == "98" and dev_mode:
             url = Prompt.ask("\n[green]Enter msteams:// link[/green]")
             data = load_data()
-            execute_join("DEV Test", url, data.get("webhook_url", ""), data.get("join_delay", 15), data.get("screenshot_delay", 300))
+            execute_join("DEV Test", url, data.get("webhook_url", ""), data.get("join_delay", 15), data.get("screenshot_delay", 300), data.get("enable_recording", False), data.get("recording_duration", 90))
         elif choice == "99" and dev_mode:
             test_url = Prompt.ask("[green]Enter the msteams:// link to test[/green]")
             data = load_data()
             target_time = (datetime.now() + timedelta(minutes=1)).strftime("%H:%M")
-            schedule.every().day.at(target_time).do(execute_join, name="Timer Test Dummy", url=test_url, webhook_url=data.get("webhook_url", ""), join_delay=data.get("join_delay", 15), screenshot_delay=data.get("screenshot_delay", 300))
+            schedule.every().day.at(target_time).do(execute_join, name="Timer Test Dummy", url=test_url, webhook_url=data.get("webhook_url", ""), join_delay=data.get("join_delay", 15), screenshot_delay=data.get("screenshot_delay", 300), enable_recording=data.get("enable_recording", False), recording_duration=data.get("recording_duration", 90))
             try:
                 while True:
                     schedule.run_pending()
@@ -542,6 +641,10 @@ def main_menu():
             except KeyboardInterrupt:
                 schedule.clear()
         elif choice == "0": sys.exit(0)
+        else:
+            continue
+            
+        console.input("\n[dim white]Press Enter to return to the menu...[/dim white]")
 
 if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] == "--background":
