@@ -4,6 +4,14 @@ daemon.pid
 daemon.log
 daemon_error.log
 verify_*.png
+recording_state.json
+recording.stop
+recording_ffmpeg.log
+classes.json.corrupt-*
+classes.json.pre-migration-*
+Recordings/
+*.partial.m4a
+*.tmp
 
 # Ignore Python and Pyinstaller build folders
 __pycache__/
@@ -12,3 +20,4 @@ dist/
 *.spec
 
 ffmpeg.exe
+ffmpeg.exe.download
